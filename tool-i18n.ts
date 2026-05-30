@@ -1,5 +1,5 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { execSync } from "node:child_process";
 
@@ -45,7 +45,6 @@ function saveCache(data: Record<string, string>): void {
   writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2), "utf-8");
 }
 
-/** Scan skill directories for descriptions */
 function scanSkills(): Array<{ name: string; description: string }> {
   const skills: Array<{ name: string; description: string }> = [];
   try {
@@ -54,7 +53,6 @@ function scanSkills(): Array<{ name: string; description: string }> {
       const skillPath = join(SKILLS_DIR, dir, "SKILL.md");
       if (!existsSync(skillPath)) continue;
       const content = readFileSync(skillPath, "utf-8");
-      // Parse frontmatter
       const nameMatch = content.match(/^---\n[\s\S]*?\bname:\s*(.+)\n[\s\S]*?\n---/);
       const descMatch = content.match(/^---\n[\s\S]*?\bdescription:\s*(?:>\s*\n)?\s*(.+?)\n[\s\S]*?\n---/);
       if (nameMatch && descMatch) {
@@ -65,6 +63,23 @@ function scanSkills(): Array<{ name: string; description: string }> {
     }
   } catch {}
   return skills;
+}
+
+function extractParams(tool: ToolInfo): Array<{ key: string; desc: string }> {
+  const out: Array<{ key: string; desc: string }> = [];
+  try {
+    const params = (tool.parameters as any) ?? {};
+    const props = params.properties ?? params.input_schema?.properties ?? {};
+    for (const [pName, pSchema] of Object.entries(props)) {
+      const desc = (pSchema as any)?.description;
+      if (desc) out.push({ key: `param:${tool.name}:${pName}`, desc });
+    }
+  } catch {}
+  return out;
+}
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -78,29 +93,30 @@ export default function (pi: ExtensionAPI) {
     translateRequested = false;
   });
 
-  // Inject translation request (tools + skills) into first user message
   pi.on("input", (event) => {
     if (translateRequested) return { action: "continue" };
 
     const allTools = pi.getAllTools();
     const untranslated: Array<{ name: string; description: string }> = [];
+    const untranslatedParams: Array<{ key: string; desc: string }> = [];
 
     for (const t of allTools) {
-      if (!t.description) continue;
-      if (translations[t.name]) continue;
-      untranslated.push({ name: t.name, description: t.description });
+      if (t.description && !translations[t.name]) {
+        untranslated.push({ name: t.name, description: t.description });
+      }
+      for (const p of extractParams(t)) {
+        if (!translations[p.key]) untranslatedParams.push(p);
+      }
     }
 
-    // Also check skills
     const skills = scanSkills();
     const untranslatedSkills: Array<{ name: string; description: string }> = [];
     for (const s of skills) {
       const key = `skill:${s.name}`;
-      if (translations[key]) continue;
-      untranslatedSkills.push(s);
+      if (!translations[key]) untranslatedSkills.push(s);
     }
 
-    if (untranslated.length === 0 && untranslatedSkills.length === 0) {
+    if (untranslated.length === 0 && untranslatedSkills.length === 0 && untranslatedParams.length === 0) {
       translateRequested = true;
       return { action: "continue" };
     }
@@ -109,6 +125,7 @@ export default function (pi: ExtensionAPI) {
     pendingTools = [
       ...untranslated.map((t) => t.name),
       ...untranslatedSkills.map((s) => `skill:${s.name}`),
+      ...untranslatedParams.map((p) => p.key),
     ];
 
     const lines: string[] = [];
@@ -118,32 +135,28 @@ export default function (pi: ExtensionAPI) {
     if (untranslatedSkills.length > 0) {
       lines.push("### 技能描述\n" + untranslatedSkills.map((s) => `- **skill:${s.name}**: ${s.description}`).join("\n"));
     }
+    if (untranslatedParams.length > 0) {
+      lines.push("### 参数描述\n" + untranslatedParams.map((p) => `- **${p.key}**: ${p.desc}`).join("\n"));
+    }
 
     const translatePrompt =
-      `\n\n[I18N] 将以下工具描述和技能描述翻译为 ${targetLang}。` +
-      `技术术语（如 bash、LLM、MCP）保留英文。` +
-      `回复一个 JSON 对象，键名为工具/技能名，键值为翻译。` +
-      `技能键名以 "skill:" 开头。\n\n` +
+      `\n\n[I18N] 将以下工具描述、技能描述和参数描述翻译为 ${targetLang}。` +
+      `技术术语保留英文。回复 JSON 对象，键名为条目名，键值为翻译。` +
+      `技能键名以 "skill:" 开头，参数键名以 "param:" 开头。\n\n` +
       lines.join("\n\n");
 
     return { action: "transform", text: event.text + translatePrompt };
   });
 
-  // Replace skill descriptions in system prompt
   pi.on("before_agent_start", (event) => {
     let sysPrompt = event.systemPrompt;
     let modified = false;
 
-    // Replace skill descriptions in <available_skills>
     if (sysPrompt.includes("<available_skills>")) {
       for (const [key, translation] of Object.entries(translations)) {
         if (!key.startsWith("skill:")) continue;
         const skillName = key.slice(6);
-        // Match <skill><name>skillName</name><description>...</description>
-        const regex = new RegExp(
-          `(<skill>\\s*<name>${escapeRegex(skillName)}<\\/name>\\s*<description>)([^<]+)(<\\/description>)`,
-          "g"
-        );
+        const regex = new RegExp(`(<skill>\\s*<name>${escapeRegex(skillName)}<\\/name>\\s*<description>)([^<]+)(<\\/description>)`, "g");
         if (regex.test(sysPrompt)) {
           sysPrompt = sysPrompt.replace(regex, `$1${translation}$3`);
           modified = true;
@@ -154,33 +167,48 @@ export default function (pi: ExtensionAPI) {
     if (modified) return { systemPrompt: sysPrompt };
   });
 
-  // Replace tool descriptions in provider payload
   pi.on("before_provider_request", (event) => {
     const payload = event.payload as any;
     if (!payload?.tools?.length) return;
     let replaced = 0;
+
     for (const tool of payload.tools) {
-      const name = tool?.function?.name ?? tool?.name;
-      if (name && translations[name]) {
-        if (tool.function) tool.function.description = translations[name];
-        else if (tool.description !== undefined) tool.description = translations[name];
+      const fn = tool.function ?? tool;
+      const name = fn.name ?? tool.name;
+      if (!name) continue;
+
+      if (translations[name] && fn.description !== undefined) {
+        fn.description = translations[name];
         replaced++;
       }
+
+      const props = fn.parameters?.properties;
+      if (props && typeof props === "object") {
+        for (const [pName, pSchema] of Object.entries(props)) {
+          const key = `param:${name}:${pName}`;
+          if (translations[key] && (pSchema as any).description) {
+            (pSchema as any).description = translations[key];
+            replaced++;
+          }
+        }
+      }
     }
+
     if (replaced > 0) return payload;
   });
 
-  // Parse translation response
   pi.on("message_end", async (event) => {
     if (pendingTools.length === 0) return;
     const msg = event.message;
     if (!msg || msg.role !== "assistant") return;
 
-    const content = msg.content;
     let text = "";
-    if (typeof content === "string") text = content;
-    else if (Array.isArray(content)) {
-      text = content.filter((c: any) => c.type === "text").map((c: any) => c.text ?? "").join(" ");
+    if (typeof msg.content === "string") text = msg.content;
+    else if (Array.isArray(msg.content)) {
+      text = (msg.content as any[])
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text ?? "")
+        .join(" ");
     }
 
     const jsonMatch = text.match(/\{[\s\S]*?\}/);
@@ -198,8 +226,4 @@ export default function (pi: ExtensionAPI) {
       if (saved > 0) { saveCache(translations); pendingTools = []; }
     } catch {}
   });
-}
-
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
