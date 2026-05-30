@@ -16,14 +16,12 @@ const CACHE_PATH = resolve(
   ".pi/agent/tool-i18n.json"
 );
 
-/** Core tools worth translating (excludes niche/board tools) */
-const CORE_TOOLS = new Set([
-  "read", "write", "edit", "bash", "grep", "find", "ls",
-  "web_search", "fetch_content", "code_search",
-  "memory_read", "memory_write", "memory_search",
-  "subagent", "mcp", "schedule_prompt", "scratchpad",
-  "propose_goal_draft", "get_goal",
-]);
+/** Skip verbose board tools — auto-translate everything else */
+const EXCLUDED_PREFIXES = ["board_", "kanban_"];
+
+function isCoreTool(name: string): boolean {
+  return !EXCLUDED_PREFIXES.some((p) => name.startsWith(p));
+}
 
 /** Detect user's display language */
 function detectLanguage(): string {
@@ -63,7 +61,7 @@ export default function (pi: ExtensionAPI) {
     const untranslated: Array<{ name: string; description: string }> = [];
 
     for (const t of allTools) {
-      if (!CORE_TOOLS.has(t.name)) continue; // skip non-core
+      if (!isCoreTool(t.name)) continue;     // skip verbose tools
       if (translations[t.name]) continue;    // already cached
       if (!t.description) continue;
       untranslated.push({ name: t.name, description: t.description });
