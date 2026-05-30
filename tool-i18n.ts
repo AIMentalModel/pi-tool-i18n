@@ -90,10 +90,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async () => {
     translations = { ...loadCache() };
-    translateRequested = false;
+    // 如果缓存中有 _initialized 标记，不再自动触发翻译
+    translateRequested = !!translations["_initialized"];
   });
 
   pi.on("input", (event) => {
+    // 只自动触发一次翻译，未覆盖的走 /i18n-retranslate
     if (translateRequested) return { action: "continue" };
 
     const allTools = pi.getAllTools();
@@ -234,7 +236,11 @@ export default function (pi: ExtensionAPI) {
           saved++;
         }
       }
-      if (saved > 0) { saveCache(translations); pendingTools = []; }
+      if (saved > 0) {
+        translations["_initialized"] = "1";
+        saveCache(translations);
+        pendingTools = [];
+      }
     } catch {}
   });
 }
