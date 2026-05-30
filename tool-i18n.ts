@@ -72,16 +72,11 @@ function extractParams(tool: ToolInfo): Array<{ key: string; desc: string }> {
     const props = params.properties ?? params.input_schema?.properties ?? {};
     for (const [pName, pSchema] of Object.entries(props)) {
       const ps = pSchema as any;
-      if (ps.description) {
-        out.push({ key: `param:${tool.name}:${pName}`, desc: ps.description });
-      }
-      // Recurse into nested objects (e.g. subagent.control.*)
+      if (ps.description) out.push({ key: `param:${tool.name}:${pName}`, desc: ps.description });
       if (ps.properties && ps.type === "object") {
         for (const [subName, subSchema] of Object.entries(ps.properties)) {
           const ss = subSchema as any;
-          if (ss.description) {
-            out.push({ key: `param:${tool.name}:${pName}:${subName}`, desc: ss.description });
-          }
+          if (ss.description) out.push({ key: `param:${tool.name}:${pName}:${subName}`, desc: ss.description });
         }
       }
     }
@@ -104,33 +99,25 @@ export default function (pi: ExtensionAPI) {
     translateRequested = false;
   });
 
-  pi.on("input", (event) => {
-    // 只自动触发一次翻译，未覆盖的走 /i18n-retranslate
-    if (translateRequested) return { action: "continue" };
+  pi.on("before_agent_start", async () => {
+    if (translateRequested) return;
 
     const allTools = pi.getAllTools();
     const untranslated: Array<{ name: string; description: string }> = [];
     const untranslatedParams: Array<{ key: string; desc: string }> = [];
 
     for (const t of allTools) {
-      if (t.description && !translations[t.name]) {
-        untranslated.push({ name: t.name, description: t.description });
-      }
-      for (const p of extractParams(t)) {
-        if (!translations[p.key]) untranslatedParams.push(p);
-      }
+      if (t.description && !translations[t.name]) untranslated.push({ name: t.name, description: t.description });
+      for (const p of extractParams(t)) if (!translations[p.key]) untranslatedParams.push(p);
     }
 
     const skills = scanSkills();
     const untranslatedSkills: Array<{ name: string; description: string }> = [];
-    for (const s of skills) {
-      const key = `skill:${s.name}`;
-      if (!translations[key]) untranslatedSkills.push(s);
-    }
+    for (const s of skills) { if (!translations[`skill:${s.name}`]) untranslatedSkills.push(s); }
 
-    if (untranslated.length === 0 && untranslatedSkills.length === 0 && untranslatedParams.length === 0) {
+    if (!untranslated.length && !untranslatedSkills.length && !untranslatedParams.length) {
       translateRequested = true;
-      return { action: "continue" };
+      return;
     }
 
     translateRequested = true;
@@ -141,112 +128,81 @@ export default function (pi: ExtensionAPI) {
     ];
 
     const lines: string[] = [];
-    if (untranslated.length > 0) {
-      lines.push("### 工具描述\n" + untranslated.map((t) => `- **${t.name}**: ${t.description}`).join("\n"));
-    }
-    if (untranslatedSkills.length > 0) {
-      lines.push("### 技能描述\n" + untranslatedSkills.map((s) => `- **skill:${s.name}**: ${s.description}`).join("\n"));
-    }
-    if (untranslatedParams.length > 0) {
-      lines.push("### 参数描述\n" + untranslatedParams.map((p) => `- **${p.key}**: ${p.desc}`).join("\n"));
-    }
+    if (untranslated.length) lines.push("### 工具描述\n" + untranslated.map((t) => `- **${t.name}**: ${t.description}`).join("\n"));
+    if (untranslatedSkills.length) lines.push("### 技能描述\n" + untranslatedSkills.map((s) => `- **skill:${s.name}**: ${s.description}`).join("\n"));
+    if (untranslatedParams.length) lines.push("### 参数描述\n" + untranslatedParams.map((p) => `- **${p.key}**: ${p.desc}`).join("\n"));
 
-    const translatePrompt =
-      `\n\n[I18N] 将以下工具描述、技能描述和参数描述翻译为 ${targetLang}。` +
-      `技术术语保留英文。回复 JSON 对象，键名为条目名，键值为翻译。` +
+    const prompt =
+      `[I18N] 将以下工具描述、技能描述和参数描述翻译为 ${targetLang}。` +
+      `技术术语保留英文。回复一个 JSON 对象，键名为条目名，键值为翻译。` +
       `技能键名以 "skill:" 开头，参数键名以 "param:" 开头。\n\n` +
       lines.join("\n\n");
 
-    return { action: "transform", text: event.text + translatePrompt };
+    return {
+      message: { customType: "i18n-translate", content: prompt, display: false },
+    };
   });
 
   pi.on("before_agent_start", (event) => {
-    let sysPrompt = event.systemPrompt;
-    let modified = false;
-
-    if (sysPrompt.includes("<available_skills>")) {
-      for (const [key, translation] of Object.entries(translations)) {
+    let sys = event.systemPrompt;
+    let mod = false;
+    if (sys.includes("<available_skills>")) {
+      for (const [key, tr] of Object.entries(translations)) {
         if (!key.startsWith("skill:")) continue;
-        const skillName = key.slice(6);
-        const regex = new RegExp(`(<skill>\\s*<name>${escapeRegex(skillName)}<\\/name>\\s*<description>)([^<]+)(<\\/description>)`, "g");
-        if (regex.test(sysPrompt)) {
-          sysPrompt = sysPrompt.replace(regex, `$1${translation}$3`);
-          modified = true;
+        const re = new RegExp(`(<skill>\\s*<name>${escapeRegex(key.slice(6))}<\\/name>\\s*<description>)([^<]+)(<\\/description>)`, "g");
+        if (re.test(sys)) { sys = sys.replace(re, `$1${tr}$3`); mod = true; }
+      }
+    }
+    if (mod) return { systemPrompt: sys };
+  });
+
+  pi.on("before_provider_request", (event) => {
+    const p = event.payload as any;
+    if (!p?.tools?.length) return;
+    let r = 0;
+    for (const t of p.tools) {
+      const fn = t.function ?? t;
+      const n = fn.name ?? t.name;
+      if (!n) continue;
+      if (translations[n] && fn.description !== undefined) { fn.description = translations[n]; r++; }
+      const props = fn.parameters?.properties;
+      if (props && typeof props === "object") {
+        for (const [pn, ps] of Object.entries(props)) {
+          const k = `param:${n}:${pn}`;
+          if (translations[k] && (ps as any).description) { (ps as any).description = translations[k]; r++; }
         }
       }
     }
+    if (r > 0) return p;
+  });
 
-    if (modified) return { systemPrompt: sysPrompt };
+  pi.on("message_end", async (event) => {
+    if (!pendingTools.length) return;
+    const msg = event.message;
+    if (!msg || msg.role !== "assistant") return;
+    let text = "";
+    if (typeof msg.content === "string") text = msg.content;
+    else if (Array.isArray(msg.content)) {
+      text = msg.content.filter((c: any) => c.type === "text").map((c: any) => c.text ?? "").join(" ");
+    }
+    const jm = text.match(/\{[\s\S]*?\}/);
+    if (!jm) return;
+    try {
+      const parsed = JSON.parse(jm[0]);
+      let saved = 0;
+      for (const [name, tr] of Object.entries(parsed)) {
+        if (typeof tr === "string" && tr && pendingTools.includes(name)) { translations[name] = tr; saved++; }
+      }
+      if (saved > 0) { saveCache(translations); pendingTools = []; }
+    } catch {}
   });
 
   pi.registerCommand("i18n-retranslate", {
     description: "清除翻译缓存，下次发消息时重新翻译所有工具/技能/参数描述",
     handler: async (_args, ctx) => {
-      translations = {};
-      pendingTools = [];
-      translateRequested = false;
-      try { existsSync(CACHE_PATH) && writeFileSync(CACHE_PATH, "{}"); } catch {}
+      translations = {}; pendingTools = []; translateRequested = false;
+      try { existsSync(CACHE_PATH) && writeFileSync(CACHE_PATH, "{}", "utf-8"); } catch {}
       ctx.ui.notify("🔄 翻译缓存已清除，下条消息将重新翻译", "info");
     },
-  });
-
-  pi.on("before_provider_request", (event) => {
-    const payload = event.payload as any;
-    if (!payload?.tools?.length) return;
-    let replaced = 0;
-
-    for (const tool of payload.tools) {
-      const fn = tool.function ?? tool;
-      const name = fn.name ?? tool.name;
-      if (!name) continue;
-
-      if (translations[name] && fn.description !== undefined) {
-        fn.description = translations[name];
-        replaced++;
-      }
-
-      const props = fn.parameters?.properties;
-      if (props && typeof props === "object") {
-        for (const [pName, pSchema] of Object.entries(props)) {
-          const key = `param:${name}:${pName}`;
-          if (translations[key] && (pSchema as any).description) {
-            (pSchema as any).description = translations[key];
-            replaced++;
-          }
-        }
-      }
-    }
-
-    if (replaced > 0) return payload;
-  });
-
-  pi.on("message_end", async (event) => {
-    if (pendingTools.length === 0) return;
-    const msg = event.message;
-    if (!msg || msg.role !== "assistant") return;
-
-    let text = "";
-    if (typeof msg.content === "string") text = msg.content;
-    else if (Array.isArray(msg.content)) {
-      text = (msg.content as any[])
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text ?? "")
-        .join(" ");
-    }
-
-    const jsonMatch = text.match(/\{[\s\S]*?\}/);
-    if (!jsonMatch) return;
-
-    try {
-      const parsed = JSON.parse(jsonMatch[0]);
-      let saved = 0;
-      for (const [name, translation] of Object.entries(parsed)) {
-        if (typeof translation === "string" && translation && pendingTools.includes(name)) {
-          translations[name] = translation;
-          saved++;
-        }
-      }
-      if (saved > 0) { saveCache(translations); pendingTools = []; }
-    } catch {}
   });
 }
