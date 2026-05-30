@@ -5,10 +5,13 @@ import { resolve } from "node:path";
 /**
  * Tool i18n extension — translates tool descriptions to user's system language.
  *
- * - Detects system locale at startup
- * - Auto-discovers core tools and translates them via LLM
- * - Caches results to ~/.pi/agent/tool-i18n.json
- * - Replaces tool descriptions in before_provider_request
+ * Workflow:
+ *   1. session_start → load cache only
+ *   2. before_provider_request (first LLM call) → detect untranslated → request LLM translation
+ *   3. before_provider_request (later calls) → replace descriptions with cached translations
+ *   4. message_end → parse LLM response, save to cache
+ *
+ * Translation is lazy — only triggers on the first LLM call, never at startup.
  */
 
 const CACHE_PATH = resolve(
@@ -16,12 +19,6 @@ const CACHE_PATH = resolve(
   ".pi/agent/tool-i18n.json"
 );
 
-/** Auto-translate all tools — no exclusions */
-function isTranslatable(_name: string): boolean {
-  return true;
-}
-
-/** Detect user's display language */
 function detectLanguage(): string {
   const lang = process.env.LANG ?? process.env.LC_ALL ?? "";
   if (lang.startsWith("zh")) return "中文 (Simplified Chinese)";
@@ -33,7 +30,6 @@ function detectLanguage(): string {
   return "English (English)";
 }
 
-// ── Cache ──────────────────────────────────────
 function loadCache(): Record<string, string> {
   try {
     if (existsSync(CACHE_PATH)) return JSON.parse(readFileSync(CACHE_PATH, "utf-8"));
@@ -45,44 +41,71 @@ function saveCache(data: Record<string, string>): void {
   writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2), "utf-8");
 }
 
-// ── Extension ──────────────────────────────────
 export default function (pi: ExtensionAPI) {
+  const targetLang = detectLanguage();
   let translations: Record<string, string> = {};
   let pendingTools: string[] = [];
   let translateRequested = false;
-  const targetLang = detectLanguage();
 
-  pi.on("session_start", async (_event) => {
+  // Step 1: load cache at startup, no LLM calls
+  pi.on("session_start", async () => {
     translations = { ...loadCache() };
+    translateRequested = false;
+  });
+
+  // Step 2: on first LLM call, detect untranslated tools and request translation
+  pi.on("before_provider_request", async (event) => {
+    // Replace descriptions with cached translations (runs every call)
+    const payload = event.payload as any;
+    if (payload?.tools?.length) {
+      let replaced = 0;
+      for (const tool of payload.tools) {
+        const name = tool?.function?.name ?? tool?.name;
+        if (name && translations[name]) {
+          if (tool.function) tool.function.description = translations[name];
+          else if (tool.description !== undefined) tool.description = translations[name];
+          replaced++;
+        }
+      }
+      if (replaced > 0) return payload;
+    }
+
+    // Lazy trigger: detect untranslated tools (once per session)
+    if (translateRequested) return;
 
     const allTools = pi.getAllTools();
     const untranslated: Array<{ name: string; description: string }> = [];
 
     for (const t of allTools) {
       if (!t.description) continue;
-      if (translations[t.name]) continue;    // already cached
+      if (translations[t.name]) continue;
       untranslated.push({ name: t.name, description: t.description });
     }
 
-    if (untranslated.length > 0 && !translateRequested) {
-      pendingTools = untranslated.map((t) => t.name);
+    if (untranslated.length === 0) {
       translateRequested = true;
-
-      const toolList = untranslated
-        .map((t, i) => `${i + 1}. **${t.name}**: ${t.description}`)
-        .join("\n");
-
-      pi.sendUserMessage(
-        `[System] Translate the following tool descriptions to ${targetLang} (keep technical terms in English):\n\n${toolList}\n\n` +
-        `Reply exactly in this format:\n` +
-        `---I18N_START---\n` +
-        untranslated.map((t) => `${t.name}|||translation`).join("\n") +
-        `\n---I18N_END---`,
-        { deliverAs: "followUp", triggerTurn: true }
-      );
+      return;
     }
+
+    translateRequested = true;
+    pendingTools = untranslated.map((t) => t.name);
+
+    const toolList = untranslated
+      .map((t, i) => `${i + 1}. **${t.name}**: ${t.description}`)
+      .join("\n");
+
+    // Send translation request as followUp — current LLM call proceeds without translations
+    pi.sendUserMessage(
+      `[System] Translate the following tool descriptions to ${targetLang} (keep technical terms in English):\n\n${toolList}\n\n` +
+      `Reply exactly in this format:\n` +
+      `---I18N_START---\n` +
+      untranslated.map((t) => `${t.name}|||translation`).join("\n") +
+      `\n---I18N_END---`,
+      { deliverAs: "followUp", triggerTurn: true }
+    );
   });
 
+  // Step 3: parse LLM translation response and save to cache
   pi.on("message_end", async (event) => {
     if (pendingTools.length === 0) return;
 
@@ -113,29 +136,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (saved > 0) {
-      const toSave: Record<string, string> = {};
-      for (const [k, v] of Object.entries(translations)) {
-        if (v) toSave[k] = v;
-      }
-      saveCache(toSave);
+      saveCache(translations);
       pendingTools = [];
     }
-  });
-
-  pi.on("before_provider_request", (event) => {
-    const payload = event.payload as any;
-    if (!payload?.tools?.length) return;
-
-    let replaced = 0;
-    for (const tool of payload.tools) {
-      const name = tool?.function?.name ?? tool?.name;
-      if (name && translations[name]) {
-        if (tool.function) tool.function.description = translations[name];
-        else if (tool.description !== undefined) tool.description = translations[name];
-        replaced++;
-      }
-    }
-
-    if (replaced > 0) return payload;
   });
 }
