@@ -1,0 +1,13 @@
+{
+  "name": "pi-tool-i18n",
+  "version": "1.0.0",
+  "description": "Pi extension — auto-translate tool descriptions to the target language via LLM, with local cache",
+  "license": "MIT",
+  "author": "gengcheng",
+  "type": "module",
+  "main": "tool-i18n.ts",
+  "keywords": ["pi", "pi-extension", "i18n", "translation", "internationalization", "localization"],
+  "pi": { "extensions": ["./tool-i18n.ts"] },
+  "files": ["tool-i18n.ts", "LICENSE", "README.md"],
+  "repository": { "type": "git", "url": "https://github.com/gengcheng/pi-tool-i18n" }
+}
