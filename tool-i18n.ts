@@ -71,8 +71,19 @@ function extractParams(tool: ToolInfo): Array<{ key: string; desc: string }> {
     const params = (tool.parameters as any) ?? {};
     const props = params.properties ?? params.input_schema?.properties ?? {};
     for (const [pName, pSchema] of Object.entries(props)) {
-      const desc = (pSchema as any)?.description;
-      if (desc) out.push({ key: `param:${tool.name}:${pName}`, desc });
+      const ps = pSchema as any;
+      if (ps.description) {
+        out.push({ key: `param:${tool.name}:${pName}`, desc: ps.description });
+      }
+      // Recurse into nested objects (e.g. subagent.control.*)
+      if (ps.properties && ps.type === "object") {
+        for (const [subName, subSchema] of Object.entries(ps.properties)) {
+          const ss = subSchema as any;
+          if (ss.description) {
+            out.push({ key: `param:${tool.name}:${pName}:${subName}`, desc: ss.description });
+          }
+        }
+      }
     }
   } catch {}
   return out;
@@ -90,8 +101,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async () => {
     translations = { ...loadCache() };
-    // 如果缓存中有 _initialized 标记，不再自动触发翻译
-    translateRequested = !!translations["_initialized"];
+    translateRequested = false;
   });
 
   pi.on("input", (event) => {
@@ -236,11 +246,7 @@ export default function (pi: ExtensionAPI) {
           saved++;
         }
       }
-      if (saved > 0) {
-        translations["_initialized"] = "1";
-        saveCache(translations);
-        pendingTools = [];
-      }
+      if (saved > 0) { saveCache(translations); pendingTools = []; }
     } catch {}
   });
 }
