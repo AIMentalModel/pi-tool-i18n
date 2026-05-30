@@ -167,6 +167,17 @@ export default function (pi: ExtensionAPI) {
     if (modified) return { systemPrompt: sysPrompt };
   });
 
+  pi.registerCommand("i18n-retranslate", {
+    description: "清除翻译缓存，下次发消息时重新翻译所有工具/技能/参数描述",
+    handler: async (_args, ctx) => {
+      translations = {};
+      pendingTools = [];
+      translateRequested = false;
+      try { existsSync(CACHE_PATH) && writeFileSync(CACHE_PATH, "{}"); } catch {}
+      ctx.ui.notify("🔄 翻译缓存已清除，下条消息将重新翻译", "info");
+    },
+  });
+
   pi.on("before_provider_request", (event) => {
     const payload = event.payload as any;
     if (!payload?.tools?.length) return;
