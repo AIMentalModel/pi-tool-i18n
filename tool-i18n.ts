@@ -1,9 +1,10 @@
 import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { execSync } from "node:child_process";
 
 const CACHE_PATH = resolve(process.env.HOME ?? "~", ".pi/agent/tool-i18n.json");
+const PENDING_PATH = resolve(process.env.HOME ?? "~", ".pi/agent/i18n-pending.json");
 const SKILLS_DIR = resolve(process.env.HOME ?? "~", ".agents/skills");
 
 const LANG_MAP: Record<string, string> = {
@@ -42,7 +43,12 @@ function loadCache(): Record<string, string> {
 }
 
 function saveCache(data: Record<string, string>): void {
-  writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2), "utf-8");
+  try { writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2), "utf-8"); } catch {}
+}
+
+function loadJson(path: string): Record<string, unknown> {
+  try { if (existsSync(path)) return JSON.parse(readFileSync(path, "utf-8")); } catch {}
+  return {};
 }
 
 function scanSkills(): Array<{ name: string; description: string }> {
@@ -88,61 +94,82 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** 收集未翻译条目 */
+function collectUntranslated(
+  tools: ToolInfo[],
+  skills: Array<{ name: string; description: string }>,
+  translations: Record<string, string>
+): { tools: Record<string, string>; skills: Record<string, string>; params: Record<string, string> } {
+  const ut: Record<string, string> = {};
+  const us: Record<string, string> = {};
+  const up: Record<string, string> = {};
+  for (const t of tools) { if (t.description && !translations[t.name]) ut[t.name] = t.description; }
+  for (const t of tools) { for (const p of extractParams(t)) { if (!translations[p.key]) up[p.key] = p.desc; } }
+  for (const s of skills) { if (!translations[`skill:${s.name}`]) us[`skill:${s.name}`] = s.description; }
+  return { tools: ut, skills: us, params: up };
+}
+
+/** 写入 pending 文件 */
+function writePending(ut: Record<string, string>, us: Record<string, string>, up: Record<string, string>): number {
+  const pending = { tools: ut, skills: us, params: up };
+  const total = Object.keys(ut).length + Object.keys(us).length + Object.keys(up).length;
+  if (total === 0) {
+    if (existsSync(PENDING_PATH)) unlinkSync(PENDING_PATH);
+    return 0;
+  }
+  writeFileSync(PENDING_PATH, JSON.stringify(pending, null, 2), "utf-8");
+  return total;
+}
+
+/** 合并 pending 翻译结果到 cache */
+function mergePending(): number {
+  if (!existsSync(PENDING_PATH)) return 0;
+  const pending = loadJson(PENDING_PATH);
+  if (!pending || typeof pending !== "object") return 0;
+
+  let merged = 0;
+  const translations = loadCache();
+
+  for (const cat of ["tools", "skills", "params"] as const) {
+    const obj = pending[cat];
+    if (!obj || typeof obj !== "object") continue;
+    for (const [key, val] of Object.entries(obj as Record<string, unknown>)) {
+      if (typeof val === "string" && val.trim()) {
+        translations[key] = val;
+        merged++;
+      }
+    }
+  }
+
+  if (merged > 0) saveCache(translations);
+  return merged;
+}
+
 export default function (pi: ExtensionAPI) {
   const targetLang = detectLanguage();
   let translations: Record<string, string> = {};
-  let pendingTools: string[] = [];
-  let translateRequested = false;
 
+  // 1️⃣ 启动时加载 cache，检测缺失，写入 pending 文件
   pi.on("session_start", async () => {
     translations = { ...loadCache() };
-    translateRequested = false;
+    const allTools = pi.getAllTools();
+    const skills = scanSkills();
+    const missing = collectUntranslated(allTools, skills, translations);
+    const total = writePending(missing.tools, missing.skills, missing.params);
   });
 
-  pi.on("before_agent_start", async () => {
-    if (translateRequested) return;
+  // 2️⃣ before_agent_start: 如果有 pending 文件，注入简短指令
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (!existsSync(PENDING_PATH)) return;
 
-    const allTools = pi.getAllTools();
-    const untranslated: Array<{ name: string; description: string }> = [];
-    const untranslatedParams: Array<{ key: string; desc: string }> = [];
-
-    for (const t of allTools) {
-      if (t.description && !translations[t.name]) untranslated.push({ name: t.name, description: t.description });
-      for (const p of extractParams(t)) if (!translations[p.key]) untranslatedParams.push(p);
-    }
-
-    const skills = scanSkills();
-    const untranslatedSkills: Array<{ name: string; description: string }> = [];
-    for (const s of skills) { if (!translations[`skill:${s.name}`]) untranslatedSkills.push(s); }
-
-    if (!untranslated.length && !untranslatedSkills.length && !untranslatedParams.length) {
-      translateRequested = true;
-      return;
-    }
-
-    translateRequested = true;
-    pendingTools = [
-      ...untranslated.map((t) => t.name),
-      ...untranslatedSkills.map((s) => `skill:${s.name}`),
-      ...untranslatedParams.map((p) => p.key),
-    ];
-
-    const lines: string[] = [];
-    if (untranslated.length) lines.push("### 工具描述\n" + untranslated.map((t) => `- **${t.name}**: ${t.description}`).join("\n"));
-    if (untranslatedSkills.length) lines.push("### 技能描述\n" + untranslatedSkills.map((s) => `- **skill:${s.name}**: ${s.description}`).join("\n"));
-    if (untranslatedParams.length) lines.push("### 参数描述\n" + untranslatedParams.map((p) => `- **${p.key}**: ${p.desc}`).join("\n"));
-
-    const prompt =
-      `[I18N] 将以下工具描述、技能描述和参数描述翻译为 ${targetLang}。` +
-      `技术术语保留英文。回复一个 JSON 对象，键名为条目名，键值为翻译。` +
-      `技能键名以 "skill:" 开头，参数键名以 "param:" 开头。\n\n` +
-      lines.join("\n\n");
+    const instruction = `[I18N] 读取 \`~/.pi/agent/i18n-pending.json\`，将其中的工具描述(tools)、技能描述(skills)、参数描述(params)翻译为 ${targetLang}。技术术语保留英文（如 API、CLI、SDK 等）。翻译后写回同一文件覆盖。`;
 
     return {
-      message: { customType: "i18n-translate", content: prompt, display: false },
+      message: { customType: "i18n-translate", content: instruction, display: false },
     };
   });
 
+  // 3️⃣ before_agent_start: 替换 skill 描述到系统提示词
   pi.on("before_agent_start", (event) => {
     let sys = event.systemPrompt;
     let mod = false;
@@ -156,6 +183,7 @@ export default function (pi: ExtensionAPI) {
     if (mod) return { systemPrompt: sys };
   });
 
+  // 4️⃣ provider 请求前替换已有翻译
   pi.on("before_provider_request", (event) => {
     const p = event.payload as any;
     if (!p?.tools?.length) return;
@@ -176,33 +204,79 @@ export default function (pi: ExtensionAPI) {
     if (r > 0) return p;
   });
 
-  pi.on("message_end", async (event) => {
-    if (!pendingTools.length) return;
-    const msg = event.message;
-    if (!msg || msg.role !== "assistant") return;
-    let text = "";
-    if (typeof msg.content === "string") text = msg.content;
-    else if (Array.isArray(msg.content)) {
-      text = msg.content.filter((c: any) => c.type === "text").map((c: any) => c.text ?? "").join(" ");
-    }
-    const jm = text.match(/\{[\s\S]*?\}/);
-    if (!jm) return;
-    try {
-      const parsed = JSON.parse(jm[0]);
-      let saved = 0;
-      for (const [name, tr] of Object.entries(parsed)) {
-        if (typeof tr === "string" && tr && pendingTools.includes(name)) { translations[name] = tr; saved++; }
+  // 5️⃣ message_end: LLM 完成翻译后，读取文件合并到 cache
+  pi.on("message_end", async (_event, ctx) => {
+    if (!existsSync(PENDING_PATH)) return;
+
+    const merged = mergePending();
+    if (merged > 0) {
+      try { unlinkSync(PENDING_PATH); } catch {}
+      // 重新加载合并后的 cache
+      translations = { ...loadCache() };
+
+      // 检查是否还有遗漏
+      const allTools = pi.getAllTools();
+      const skills = scanSkills();
+      const remaining = collectUntranslated(allTools, skills, translations);
+      const remainTotal = writePending(remaining.tools, remaining.skills, remaining.params);
+
+      if (ctx.ui?.notify) {
+        if (remainTotal > 0) {
+          ctx.ui.notify(`🌐 已保存 ${merged} 条翻译，还剩 ${remainTotal} 条等待下轮处理`, "info");
+        } else {
+          ctx.ui.notify(`🌐 已保存 ${merged} 条翻译，缓存完整 ✓`, "info");
+        }
       }
-      if (saved > 0) { saveCache(translations); pendingTools = []; }
-    } catch {}
+    }
   });
 
-  pi.registerCommand("i18n-retranslate", {
-    description: "清除翻译缓存，下次发消息时重新翻译所有工具/技能/参数描述",
+  // ─── 命令 ───
+
+  // 查看状态
+  pi.registerCommand("i18n-status", {
+    description: "查看翻译缓存状态",
     handler: async (_args, ctx) => {
-      translations = {}; pendingTools = []; translateRequested = false;
-      try { existsSync(CACHE_PATH) && writeFileSync(CACHE_PATH, "{}", "utf-8"); } catch {}
-      ctx.ui.notify("🔄 翻译缓存已清除，下条消息将重新翻译", "info");
+      const cached = Object.keys(translations).length;
+      const allTools = pi.getAllTools();
+      const skills = scanSkills();
+      const missing = collectUntranslated(allTools, skills, translations);
+      const total = Object.keys(missing.tools).length + Object.keys(missing.skills).length + Object.keys(missing.params).length;
+      const hasPending = existsSync(PENDING_PATH);
+      ctx.ui.notify(`📊 已缓存: ${cached} 条 | 未翻译: ${total} 条${hasPending ? " | 📝 等待翻译中..." : ""}`, "info");
+    },
+  });
+
+  // 清除缓存，下次全量重翻
+  pi.registerCommand("i18n-clear", {
+    description: "清除翻译缓存，下次发送消息时全量重翻",
+    handler: async (_args, ctx) => {
+      translations = {};
+      try {
+        if (existsSync(CACHE_PATH)) writeFileSync(CACHE_PATH, "{}", "utf-8");
+        if (existsSync(PENDING_PATH)) unlinkSync(PENDING_PATH);
+      } catch {}
+      // 重新生成 pending
+      const allTools = pi.getAllTools();
+      const skills = scanSkills();
+      const missing = collectUntranslated(allTools, skills, {});
+      const total = writePending(missing.tools, missing.skills, missing.params);
+      ctx.ui.notify(`🔄 缓存已清除，${total} 条待翻译，下次发消息时自动处理`, "info");
+    },
+  });
+
+  // 手动强制翻译
+  pi.registerCommand("i18n-translate", {
+    description: "强制重新生成待翻译文件并触发翻译",
+    handler: async (_args, ctx) => {
+      const allTools = pi.getAllTools();
+      const skills = scanSkills();
+      const missing = collectUntranslated(allTools, skills, translations);
+      const total = writePending(missing.tools, missing.skills, missing.params);
+      if (total === 0) {
+        ctx.ui.notify("✅ 所有描述已翻译，无需更新", "info");
+      } else {
+        ctx.ui.notify(`🌐 已生成 ${total} 条待翻译，下次发消息时自动处理`, "info");
+      }
     },
   });
 }
