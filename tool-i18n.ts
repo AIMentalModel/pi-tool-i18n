@@ -113,17 +113,17 @@ export default function (pi: ExtensionAPI) {
 
     const lines: string[] = [];
     if (untranslated.length > 0) {
-      lines.push("### Tools\n" + untranslated.map((t) => `- **${t.name}**: ${t.description}`).join("\n"));
+      lines.push("### 工具描述\n" + untranslated.map((t) => `- **${t.name}**: ${t.description}`).join("\n"));
     }
     if (untranslatedSkills.length > 0) {
-      lines.push("### Skills\n" + untranslatedSkills.map((s) => `- **skill:${s.name}**: ${s.description}`).join("\n"));
+      lines.push("### 技能描述\n" + untranslatedSkills.map((s) => `- **skill:${s.name}**: ${s.description}`).join("\n"));
     }
 
     const translatePrompt =
-      `\n\n[I18N] Translate these tool descriptions and skill descriptions to ${targetLang}. ` +
-      `Keep technical terms in English. ` +
-      `Reply with a JSON object where keys are names and values are translations. ` +
-      `Skill keys start with "skill:" prefix.\n\n` +
+      `\n\n[I18N] 将以下工具描述和技能描述翻译为 ${targetLang}。` +
+      `技术术语（如 bash、LLM、MCP）保留英文。` +
+      `回复一个 JSON 对象，键名为工具/技能名，键值为翻译。` +
+      `技能键名以 "skill:" 开头。\n\n` +
       lines.join("\n\n");
 
     return { action: "transform", text: event.text + translatePrompt };
