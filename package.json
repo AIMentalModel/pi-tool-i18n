@@ -1,7 +1,7 @@
 {
   "name": "pi-tool-i18n",
-  "version": "1.0.0",
-  "description": "Pi extension \u2014 auto-translate tool descriptions to the target language via LLM, with local cache",
+  "version": "2.0.0",
+  "description": "Pi extension \u2014 auto-translate core tool descriptions to your locale via LLM",
   "license": "MIT",
   "author": "gengcheng",
   "type": "module",
