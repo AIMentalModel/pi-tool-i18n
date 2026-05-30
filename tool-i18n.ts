@@ -1,41 +1,70 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
-
-/**
- * Tool i18n extension — translates tool descriptions to user's system language.
- *
- * Workflow:
- *   1. session_start → load cache only, no LLM calls
- *   2. before_agent_start (first user message) → detect untranslated → request LLM translation via followUp
- *   3. before_provider_request (every LLM call) → replace descriptions with cached translations
- *   4. message_end → parse LLM response, save to cache
- *
- * Translation is lazy — only triggers on first user message, never at startup or during streaming.
- */
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { execSync } from "node:child_process";
 
 const CACHE_PATH = resolve(process.env.HOME ?? "~", ".pi/agent/tool-i18n.json");
+const SKILLS_DIR = resolve(process.env.HOME ?? "~", ".agents/skills");
+
+const LANG_MAP: Record<string, string> = {
+  zh: "中文 (Simplified Chinese)", ja: "日本語 (Japanese)", ko: "한국어 (Korean)",
+  fr: "Français (French)", de: "Deutsch (German)", es: "Español (Spanish)",
+};
+
+function matchLang(code: string): string | null {
+  for (const [p, n] of Object.entries(LANG_MAP)) { if (code.startsWith(p)) return n; }
+  return null;
+}
 
 function detectLanguage(): string {
-  const lang = process.env.LANG ?? process.env.LC_ALL ?? "";
-  if (lang.startsWith("zh")) return "中文 (Simplified Chinese)";
-  if (lang.startsWith("ja")) return "日本語 (Japanese)";
-  if (lang.startsWith("ko")) return "한국어 (Korean)";
-  if (lang.startsWith("fr")) return "Français (French)";
-  if (lang.startsWith("de")) return "Deutsch (German)";
-  if (lang.startsWith("es")) return "Español (Spanish)";
+  const env = process.env.LANG ?? process.env.LC_ALL ?? process.env.LANGUAGE ?? "";
+  const fromEnv = matchLang(env);
+  if (fromEnv) return fromEnv;
+  if (!env || /^C(\.|$)|^POSIX/.test(env)) {
+    try {
+      if (process.platform === "darwin") {
+        const locale = execSync("defaults read -g AppleLocale 2>/dev/null || echo ''", { encoding: "utf-8", timeout: 1000 }).trim();
+        const fromMac = matchLang(locale);
+        if (fromMac) return fromMac;
+      } else if (process.platform === "linux") {
+        const out = execSync("locale 2>/dev/null | grep -i lang || cat /etc/locale.conf 2>/dev/null | grep LANG || echo ''", { encoding: "utf-8", timeout: 1000 });
+        const fromLinux = matchLang(out);
+        if (fromLinux) return fromLinux;
+      }
+    } catch {}
+  }
   return "English (English)";
 }
 
 function loadCache(): Record<string, string> {
-  try {
-    if (existsSync(CACHE_PATH)) return JSON.parse(readFileSync(CACHE_PATH, "utf-8"));
-  } catch {}
+  try { if (existsSync(CACHE_PATH)) return JSON.parse(readFileSync(CACHE_PATH, "utf-8")); } catch {}
   return {};
 }
 
 function saveCache(data: Record<string, string>): void {
   writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2), "utf-8");
+}
+
+/** Scan skill directories for descriptions */
+function scanSkills(): Array<{ name: string; description: string }> {
+  const skills: Array<{ name: string; description: string }> = [];
+  try {
+    if (!existsSync(SKILLS_DIR)) return skills;
+    for (const dir of readdirSync(SKILLS_DIR)) {
+      const skillPath = join(SKILLS_DIR, dir, "SKILL.md");
+      if (!existsSync(skillPath)) continue;
+      const content = readFileSync(skillPath, "utf-8");
+      // Parse frontmatter
+      const nameMatch = content.match(/^---\n[\s\S]*?\bname:\s*(.+)\n[\s\S]*?\n---/);
+      const descMatch = content.match(/^---\n[\s\S]*?\bdescription:\s*(?:>\s*\n)?\s*(.+?)\n[\s\S]*?\n---/);
+      if (nameMatch && descMatch) {
+        const name = nameMatch[1].trim();
+        const desc = descMatch[1].trim().replace(/\n\s+/g, " ");
+        if (desc) skills.push({ name, description: desc });
+      }
+    }
+  } catch {}
+  return skills;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -44,16 +73,14 @@ export default function (pi: ExtensionAPI) {
   let pendingTools: string[] = [];
   let translateRequested = false;
 
-  // Step 1: load cache at startup
   pi.on("session_start", async () => {
     translations = { ...loadCache() };
     translateRequested = false;
   });
 
-  // Step 2: on first user message, detect untranslated tools and request translation
-  // before_agent_start fires when system is idle — followUp messages work here
-  pi.on("before_agent_start", async () => {
-    if (translateRequested) return;
+  // Inject translation request (tools + skills) into first user message
+  pi.on("input", (event) => {
+    if (translateRequested) return { action: "continue" };
 
     const allTools = pi.getAllTools();
     const untranslated: Array<{ name: string; description: string }> = [];
@@ -64,37 +91,73 @@ export default function (pi: ExtensionAPI) {
       untranslated.push({ name: t.name, description: t.description });
     }
 
-    if (untranslated.length === 0) {
+    // Also check skills
+    const skills = scanSkills();
+    const untranslatedSkills: Array<{ name: string; description: string }> = [];
+    for (const s of skills) {
+      const key = `skill:${s.name}`;
+      if (translations[key]) continue;
+      untranslatedSkills.push(s);
+    }
+
+    if (untranslated.length === 0 && untranslatedSkills.length === 0) {
       translateRequested = true;
-      return;
+      return { action: "continue" };
     }
 
     translateRequested = true;
-    pendingTools = untranslated.map((t) => t.name);
+    pendingTools = [
+      ...untranslated.map((t) => t.name),
+      ...untranslatedSkills.map((s) => `skill:${s.name}`),
+    ];
 
-    const toolList = untranslated
-      .map((t, i) => `${i + 1}. **${t.name}**: ${t.description}`)
-      .join("\n");
+    const lines: string[] = [];
+    if (untranslated.length > 0) {
+      lines.push("### Tools\n" + untranslated.map((t) => `- **${t.name}**: ${t.description}`).join("\n"));
+    }
+    if (untranslatedSkills.length > 0) {
+      lines.push("### Skills\n" + untranslatedSkills.map((s) => `- **skill:${s.name}**: ${s.description}`).join("\n"));
+    }
 
-    pi.sendUserMessage(
-      `[System] Translate the following tool descriptions to ${targetLang} (keep technical terms like "bash", "LLM", "MCP" in English).
-Return a JSON object where keys are the tool names and values are the translations.
-Example: {"bash": "执行 Shell 命令"}
+    const translatePrompt =
+      `\n\n[I18N] Translate these tool descriptions and skill descriptions to ${targetLang}. ` +
+      `Keep technical terms in English. ` +
+      `Reply with a JSON object where keys are names and values are translations. ` +
+      `Skill keys start with "skill:" prefix.\n\n` +
+      lines.join("\n\n");
 
-Tools to translate:
-
-${toolList}
-
-`,
-      { deliverAs: "followUp" }
-    );
+    return { action: "transform", text: event.text + translatePrompt };
   });
 
-  // Step 3: replace descriptions with cached translations on every LLM call
+  // Replace skill descriptions in system prompt
+  pi.on("before_agent_start", (event) => {
+    let sysPrompt = event.systemPrompt;
+    let modified = false;
+
+    // Replace skill descriptions in <available_skills>
+    if (sysPrompt.includes("<available_skills>")) {
+      for (const [key, translation] of Object.entries(translations)) {
+        if (!key.startsWith("skill:")) continue;
+        const skillName = key.slice(6);
+        // Match <skill><name>skillName</name><description>...</description>
+        const regex = new RegExp(
+          `(<skill>\\s*<name>${escapeRegex(skillName)}<\\/name>\\s*<description>)([^<]+)(<\\/description>)`,
+          "g"
+        );
+        if (regex.test(sysPrompt)) {
+          sysPrompt = sysPrompt.replace(regex, `$1${translation}$3`);
+          modified = true;
+        }
+      }
+    }
+
+    if (modified) return { systemPrompt: sysPrompt };
+  });
+
+  // Replace tool descriptions in provider payload
   pi.on("before_provider_request", (event) => {
     const payload = event.payload as any;
     if (!payload?.tools?.length) return;
-
     let replaced = 0;
     for (const tool of payload.tools) {
       const name = tool?.function?.name ?? tool?.name;
@@ -104,14 +167,12 @@ ${toolList}
         replaced++;
       }
     }
-
     if (replaced > 0) return payload;
   });
 
-  // Step 4: parse LLM translation response and save to cache
+  // Parse translation response
   pi.on("message_end", async (event) => {
     if (pendingTools.length === 0) return;
-
     const msg = event.message;
     if (!msg || msg.role !== "assistant") return;
 
@@ -119,49 +180,26 @@ ${toolList}
     let text = "";
     if (typeof content === "string") text = content;
     else if (Array.isArray(content)) {
-      text = content
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text ?? "")
-        .join("");
+      text = content.filter((c: any) => c.type === "text").map((c: any) => c.text ?? "").join(" ");
     }
 
-    // Try JSON first (modern format)
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      try {
-        const parsed = JSON.parse(jsonMatch[0]);
-        let saved = 0;
-        for (const [name, translation] of Object.entries(parsed)) {
-          if (typeof translation === "string" && translation && pendingTools.includes(name)) {
-            translations[name] = translation;
-            saved++;
-          }
-        }
-        if (saved > 0) {
-          saveCache(translations);
-          pendingTools = [];
-        }
-        return;
-      } catch {}
-    }
+    const jsonMatch = text.match(/\{[\s\S]*?\}/);
+    if (!jsonMatch) return;
 
-    // Fallback: ---I18N_START--- format
-    const match = text.match(/---I18N_START---\n([\s\S]*?)\n---I18N_END---/);
-    if (!match) return;
-
-    let saved = 0;
-    for (const line of match[1].trim().split("\n")) {
-      const [name, ...rest] = line.split("|||");
-      const translation = rest.join("|||").trim();
-      if (name && translation && pendingTools.includes(name.trim())) {
-        translations[name.trim()] = translation;
-        saved++;
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      let saved = 0;
+      for (const [name, translation] of Object.entries(parsed)) {
+        if (typeof translation === "string" && translation && pendingTools.includes(name)) {
+          translations[name] = translation;
+          saved++;
+        }
       }
-    }
-
-    if (saved > 0) {
-      saveCache(translations);
-      pendingTools = [];
-    }
+      if (saved > 0) { saveCache(translations); pendingTools = []; }
+    } catch {}
   });
+}
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

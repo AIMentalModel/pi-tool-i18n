@@ -1,6 +1,6 @@
 {
   "name": "pi-tool-i18n",
-  "version": "2.4.0",
+  "version": "3.0.0",
   "description": "Pi extension \u2014 auto-translate all tool descriptions to your locale via LLM",
   "license": "MIT",
   "author": "gengcheng",
