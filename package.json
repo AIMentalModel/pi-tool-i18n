@@ -1,12 +1,13 @@
 {
   "name": "pi-tool-i18n",
-  "version": "3.6.0",
+  "version": "3.6.1",
   "description": "Pi extension \u2014 auto-translate all tool descriptions to your locale via LLM",
   "license": "MIT",
   "author": "gengcheng",
   "type": "module",
   "main": "tool-i18n.ts",
   "keywords": [
+    "pi-package",
     "pi",
     "pi-extension",
     "i18n",
