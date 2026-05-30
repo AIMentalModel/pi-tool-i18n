@@ -16,11 +16,9 @@ const CACHE_PATH = resolve(
   ".pi/agent/tool-i18n.json"
 );
 
-/** Skip verbose board tools — auto-translate everything else */
-const EXCLUDED_PREFIXES = ["board_", "kanban_"];
-
-function isCoreTool(name: string): boolean {
-  return !EXCLUDED_PREFIXES.some((p) => name.startsWith(p));
+/** Auto-translate all tools — no exclusions */
+function isTranslatable(_name: string): boolean {
+  return true;
 }
 
 /** Detect user's display language */
@@ -61,9 +59,8 @@ export default function (pi: ExtensionAPI) {
     const untranslated: Array<{ name: string; description: string }> = [];
 
     for (const t of allTools) {
-      if (!isCoreTool(t.name)) continue;     // skip verbose tools
-      if (translations[t.name]) continue;    // already cached
       if (!t.description) continue;
+      if (translations[t.name]) continue;    // already cached
       untranslated.push({ name: t.name, description: t.description });
     }
 
