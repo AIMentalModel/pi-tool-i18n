@@ -6,18 +6,15 @@ import { resolve } from "node:path";
  * Tool i18n extension — translates tool descriptions to user's system language.
  *
  * Workflow:
- *   1. session_start → load cache only
- *   2. before_provider_request (first LLM call) → detect untranslated → request LLM translation
- *   3. before_provider_request (later calls) → replace descriptions with cached translations
+ *   1. session_start → load cache only, no LLM calls
+ *   2. before_agent_start (first user message) → detect untranslated → request LLM translation via followUp
+ *   3. before_provider_request (every LLM call) → replace descriptions with cached translations
  *   4. message_end → parse LLM response, save to cache
  *
- * Translation is lazy — only triggers on the first LLM call, never at startup.
+ * Translation is lazy — only triggers on first user message, never at startup or during streaming.
  */
 
-const CACHE_PATH = resolve(
-  process.env.HOME ?? "~",
-  ".pi/agent/tool-i18n.json"
-);
+const CACHE_PATH = resolve(process.env.HOME ?? "~", ".pi/agent/tool-i18n.json");
 
 function detectLanguage(): string {
   const lang = process.env.LANG ?? process.env.LC_ALL ?? "";
@@ -47,30 +44,15 @@ export default function (pi: ExtensionAPI) {
   let pendingTools: string[] = [];
   let translateRequested = false;
 
-  // Step 1: load cache at startup, no LLM calls
+  // Step 1: load cache at startup
   pi.on("session_start", async () => {
     translations = { ...loadCache() };
     translateRequested = false;
   });
 
-  // Step 2: on first LLM call, detect untranslated tools and request translation
-  pi.on("before_provider_request", async (event) => {
-    // Replace descriptions with cached translations (runs every call)
-    const payload = event.payload as any;
-    if (payload?.tools?.length) {
-      let replaced = 0;
-      for (const tool of payload.tools) {
-        const name = tool?.function?.name ?? tool?.name;
-        if (name && translations[name]) {
-          if (tool.function) tool.function.description = translations[name];
-          else if (tool.description !== undefined) tool.description = translations[name];
-          replaced++;
-        }
-      }
-      if (replaced > 0) return payload;
-    }
-
-    // Lazy trigger: detect untranslated tools (once per session)
+  // Step 2: on first user message, detect untranslated tools and request translation
+  // before_agent_start fires when system is idle — followUp messages work here
+  pi.on("before_agent_start", async () => {
     if (translateRequested) return;
 
     const allTools = pi.getAllTools();
@@ -94,18 +76,34 @@ export default function (pi: ExtensionAPI) {
       .map((t, i) => `${i + 1}. **${t.name}**: ${t.description}`)
       .join("\n");
 
-    // Send translation request as followUp — current LLM call proceeds without translations
     pi.sendUserMessage(
       `[System] Translate the following tool descriptions to ${targetLang} (keep technical terms in English):\n\n${toolList}\n\n` +
-      `Reply exactly in this format:\n` +
-      `---I18N_START---\n` +
+      `Reply exactly in this format:\n---I18N_START---\n` +
       untranslated.map((t) => `${t.name}|||translation`).join("\n") +
       `\n---I18N_END---`,
-      { deliverAs: "followUp", triggerTurn: true }
+      { deliverAs: "followUp" }
     );
   });
 
-  // Step 3: parse LLM translation response and save to cache
+  // Step 3: replace descriptions with cached translations on every LLM call
+  pi.on("before_provider_request", (event) => {
+    const payload = event.payload as any;
+    if (!payload?.tools?.length) return;
+
+    let replaced = 0;
+    for (const tool of payload.tools) {
+      const name = tool?.function?.name ?? tool?.name;
+      if (name && translations[name]) {
+        if (tool.function) tool.function.description = translations[name];
+        else if (tool.description !== undefined) tool.description = translations[name];
+        replaced++;
+      }
+    }
+
+    if (replaced > 0) return payload;
+  });
+
+  // Step 4: parse LLM translation response and save to cache
   pi.on("message_end", async (event) => {
     if (pendingTools.length === 0) return;
 
