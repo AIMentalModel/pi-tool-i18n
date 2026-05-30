@@ -77,10 +77,15 @@ export default function (pi: ExtensionAPI) {
       .join("\n");
 
     pi.sendUserMessage(
-      `[System] Translate the following tool descriptions to ${targetLang} (keep technical terms in English):\n\n${toolList}\n\n` +
-      `Reply exactly in this format:\n---I18N_START---\n` +
-      untranslated.map((t) => `${t.name}|||translation`).join("\n") +
-      `\n---I18N_END---`,
+      `[System] Translate the following tool descriptions to ${targetLang} (keep technical terms like "bash", "LLM", "MCP" in English).
+Return a JSON object where keys are the tool names and values are the translations.
+Example: {"bash": "执行 Shell 命令"}
+
+Tools to translate:
+
+${toolList}
+
+`,
       { deliverAs: "followUp" }
     );
   });
@@ -120,6 +125,27 @@ export default function (pi: ExtensionAPI) {
         .join("");
     }
 
+    // Try JSON first (modern format)
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        let saved = 0;
+        for (const [name, translation] of Object.entries(parsed)) {
+          if (typeof translation === "string" && translation && pendingTools.includes(name)) {
+            translations[name] = translation;
+            saved++;
+          }
+        }
+        if (saved > 0) {
+          saveCache(translations);
+          pendingTools = [];
+        }
+        return;
+      } catch {}
+    }
+
+    // Fallback: ---I18N_START--- format
     const match = text.match(/---I18N_START---\n([\s\S]*?)\n---I18N_END---/);
     if (!match) return;
 
